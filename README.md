@@ -1,6 +1,6 @@
 # AI_ADAPTER
 
-An adapter layer for VoIP cameras that enables "bring your own model" functionality. Camera applications capture images and apply user-selected AI models through a unified API interface.
+An adapter layer for VoIP cameras that enables "bring your own model" functionality.
 =======
 An adapter layer for VoIP cameras that enables "bring your own model" functionality.
 
