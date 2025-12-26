@@ -28,5 +28,5 @@ ENABLED_TASKS = {
 }
 
 # Model inference settings
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.20  # Balanced - detects distant people, fewer false positives
 INPUT_SIZE = 640

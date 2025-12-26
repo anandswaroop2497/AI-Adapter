@@ -5,12 +5,14 @@ import onnxruntime as ort
 import cv2
 import numpy as np
 import time
+import os
 from typing import List, Dict, Any
 from fastapi import HTTPException
 
 from .base_handler import BaseModelHandler
 from ..utils.image_utils import load_image_from_uri
-from ..config import CONFIDENCE_THRESHOLD, INPUT_SIZE
+from ..utils.visualization import draw_bounding_boxes
+from ..config import CONFIDENCE_THRESHOLD, INPUT_SIZE, BASE_FRAMES_DIR
 
 
 class YOLOv8Handler(BaseModelHandler):
@@ -100,7 +102,11 @@ class YOLOv8Handler(BaseModelHandler):
     
     def _filter_person_detections(self, predictions: np.ndarray) -> np.ndarray:
         """
-        Filter predictions to get only person class with confidence > threshold.
+        Filter predictions to get only person class with adaptive confidence threshold.
+        
+        Uses size-based adaptive threshold:
+        - Small objects (distant people): lower threshold (0.15)
+        - Large objects (close people): higher threshold (0.25)
         
         Args:
             predictions: Raw model predictions
@@ -108,9 +114,30 @@ class YOLOv8Handler(BaseModelHandler):
         Returns:
             Filtered person detections
         """
-        # Filter by confidence threshold
-        person_rows = predictions[predictions[:, 4] > CONFIDENCE_THRESHOLD]
-        return person_rows
+        # Adaptive threshold based on bounding box size
+        # Small bbox (w*h < 0.05 of image) = distant person → use lower threshold (0.15)
+        # Large bbox = close person → use higher threshold (0.25)
+        
+        filtered_rows = []
+        for pred in predictions:
+            cx, cy, w, h, conf = pred[:5]
+            
+            # Calculate bbox area (normalized, where 1.0 = full image)
+            if w < 1.0:  # Normalized coordinates
+                bbox_area = w * h
+            else:  # Pixel coordinates (convert to normalized)
+                bbox_area = (w / INPUT_SIZE) * (h / INPUT_SIZE)
+            
+            # Adaptive threshold based on size
+            # Small objects (area < 0.05): threshold = 0.15
+            # Large objects (area >= 0.05): threshold = 0.25
+            threshold = 0.15 if bbox_area < 0.05 else 0.25
+            
+            # Keep detection if confidence > adaptive threshold
+            if conf > threshold:
+                filtered_rows.append(pred)
+        
+        return np.array(filtered_rows) if filtered_rows else np.array([])
     
     def _convert_bbox(self, cx: float, cy: float, w: float, h: float, 
                       img_width: int, img_height: int) -> List[int]:
@@ -140,7 +167,7 @@ class YOLOv8Handler(BaseModelHandler):
         
         return [max(0, left), max(0, top), width, height]
     
-    def _apply_nms(self, detections: List[Dict], iou_threshold: float = 0.45) -> List[Dict]:
+    def _apply_nms(self, detections: List[Dict], iou_threshold: float = 0.3) -> List[Dict]:
         """
         Apply Non-Maximum Suppression to remove duplicate detections.
         
@@ -255,8 +282,15 @@ class YOLOv8Handler(BaseModelHandler):
                 "confidence": round(conf, 2)
             })
         
+        # Debug: Show raw detection count
+        print(f"[DEBUG] Raw detections before NMS: {len(detections)}")
+        
         # Apply NMS to remove duplicate detections of same person
-        detections = self._apply_nms(detections, iou_threshold=0.45)
+        # Very high IoU threshold (0.65) allows people to be very close without merging
+        detections = self._apply_nms(detections, iou_threshold=0.65)
+        
+        # Debug: Show final count after NMS
+        print(f"[DEBUG] Detections after NMS: {len(detections)}")
         
         # Sort by confidence (highest first)
         detections.sort(key=lambda x: x["confidence"], reverse=True)
@@ -275,6 +309,28 @@ class YOLOv8Handler(BaseModelHandler):
             "executed_at": int(time.time() * 1000),
             "latency_ms": int((time.time() - start_time) * 1000)
         }
+        
+        # Generate annotated image with bounding boxes
+        if detections:
+            annotated_img = draw_bounding_boxes(
+                img,
+                detections,
+                count=len(detections),
+                show_labels=True,
+                show_count=True
+            )
+            
+            # Save annotated image (extract camera_id from URI)
+            # URI format: kavach://frames/camera_X/latest.jpg
+            uri_parts = uri.replace("kavach://frames/", "").split("/")
+            camera_dir = uri_parts[0] if uri_parts else "camera_0"
+            
+            annotated_path = os.path.join(BASE_FRAMES_DIR, camera_dir, "annotated.jpg")
+            cv2.imwrite(annotated_path, annotated_img)
+            
+            # Include annotated image URI in response
+            result["annotated_image_uri"] = f"kavach://frames/{camera_dir}/annotated.jpg"
+            print(f"[VISUALIZATION] Saved annotated image to {annotated_path}")
         
         print(f"[COUNTING] Count={result['count']}, Avg Conf={result['confidence']}")
         return result

@@ -1,0 +1,1192 @@
+================================================================================
+                    AI_ADAPTER CODEBASE EXPLANATION
+================================================================================
+
+OVERVIEW
+--------
+This is an AI model adapter layer for VoIP camera systems. It provides a 
+"bring your own model" facility where camera applications can capture images 
+and apply user-selected AI models through a unified REST API.
+
+The codebase follows a modular Model Handler Pattern that makes it scalable 
+and easy to add new AI models without changing the core infrastructure.
+
+
+================================================================================
+                        EXECUTION FLOW DIAGRAM
+================================================================================
+
+Step 1: USER STARTS THE ADAPTER SERVER
+---------------------------------------
+Command: uvicorn adapter.main:app --reload --port 9100
+
+What happens:
+1. Python imports adapter.main module
+2. FastAPI app object is created
+3. startup_event() function runs automatically
+4. YOLOv8 model is loaded and registered
+5. Server starts listening on port 9100
+
+
+Step 2: USER STARTS THE CAMERA RUNNER
+--------------------------------------
+Command: python kavach/runner.py --task person_detection
+
+What happens:
+1. runner.py opens camera (or watches existing frames)
+2. Captures image frame every 2 seconds
+3. Saves frame to frames/camera_0/latest.jpg
+4. Sends HTTP POST request to http://127.0.0.1:9100/infer
+5. Receives inference results
+6. Displays results to console
+
+
+Step 3: INFERENCE REQUEST PROCESSING
+-------------------------------------
+1. Runner sends JSON request with task name and image URI
+2. Adapter's /infer endpoint receives request
+3. Adapter validates task name
+4. Adapter gets handler from model_registry
+5. Handler loads image from URI
+6. Handler preprocesses image
+7. Handler runs ONNX model inference
+8. Handler processes predictions
+9. Handler returns JSON response
+10. Runner displays results
+
+
+================================================================================
+                    FILE-BY-FILE BREAKDOWN (EXECUTION ORDER)
+================================================================================
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 1: adapter/config.py
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Configuration file - loaded FIRST when adapter starts
+IMPORTS: os
+WHEN IMPORTED: When main.py imports this module
+
+WHAT IT CONTAINS:
+-----------------
+1. BASE_DIR - Path to adapter directory
+2. BASE_FRAMES_DIR - Path to frames directory (../frames)
+3. MODEL_CONFIGS - Dictionary mapping model names to file paths
+   Example: "yolov8n" -> path to yolov8n.onnx file
+4. ENABLED_TASKS - Dictionary controlling which tasks are active
+   Example: "person_detection": True, "person_counting": True
+5. CONFIDENCE_THRESHOLD - Minimum confidence for detections (0.5)
+6. INPUT_SIZE - Model input size (640x640)
+
+WHY WRITTEN:
+-----------
+- Centralized configuration management
+- Easy to enable/disable tasks without code changes
+- Easy to add new models by updating dictionary
+- Separation of configuration from business logic
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 2: adapter/models/base_handler.py
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Abstract base class for all model handlers
+IMPORTS: ABC, abstractmethod, List, Dict, Any (Python built-ins)
+WHEN IMPORTED: When yolov8_handler.py inherits from it
+
+WHAT IT CONTAINS:
+-----------------
+1. BaseModelHandler class (Abstract Base Class)
+   - __init__() - Stores model_path and session
+   - get_supported_tasks() - ABSTRACT METHOD (must be implemented)
+   - infer() - ABSTRACT METHOD (must be implemented)
+   - validate_task() - Helper to check if task is supported
+
+WHY WRITTEN:
+-----------
+- Enforces consistent interface for all model handlers
+- Any new model handler MUST implement get_supported_tasks() and infer()
+- Provides common functionality (validate_task)
+- Enables polymorphism - main.py can work with any handler
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 3: adapter/utils/visualization.py
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Server-side visualization utility for annotating images
+IMPORTS: cv2, numpy, typing (List, Dict, Optional)
+WHEN IMPORTED: When yolov8_handler.py needs to draw bounding boxes
+
+WHAT IT CONTAINS:
+-----------------
+1. COLORS - 8-color palette for bounding boxes (BGR format)
+   - Green, Blue, Red, Yellow, Magenta, Cyan, Purple, Orange
+   - Used to differentiate multiple detections
+
+2. draw_bounding_boxes(image, detections, count, show_labels, show_count)
+   INPUTS:
+   - image: Original frame as numpy array
+   - detections: List of {"bbox": [x,y,w,h], "confidence": float}
+   - count: Optional overall count to display
+   - show_labels: Boolean to show/hide individual labels
+   - show_count: Boolean to show/hide count overlay
+   
+   PROCESS:
+   - Creates copy of image to avoid modifying original
+   - For each detection:
+     * Gets unique color from palette (cycles through 8 colors)
+     * Draws rectangle around object (3px thick)
+     * Creates label "Person X: confidence"
+     * Draws colored background for label
+     * Writes white text on colored background
+   - Optionally adds overall count in top-left corner
+   
+   OUTPUT:
+   - Returns annotated image with all visualizations
+
+WHY WRITTEN:
+-----------
+- Provides visualization as an API service
+- Clients (React, mobile, web) don't need to implement drawing
+- Consistent visualization across all clients
+- Reusable utility for any detection task
+- Server-side processing reduces client complexity
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 4: adapter/utils/image_utils.py
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Image loading and validation utilities
+IMPORTS: os, cv2, HTTPException, config.BASE_FRAMES_DIR
+WHEN IMPORTED: When yolov8_handler.py needs to load images
+
+WHAT IT CONTAINS:
+-----------------
+1. load_image_from_uri(uri) - Main function to load images
+   - Converts Kavach URI to file system path
+   - URI format: kavach://frames/camera_0/latest.jpg
+   - Actual path: <BASE_FRAMES_DIR>/camera_0/latest.jpg
+   - Reads image using OpenCV
+   - Returns numpy array
+
+2. validate_image(img) - Validates loaded image
+   - Checks if image is None
+   - Raises HTTPException if invalid
+
+WHY WRITTEN:
+-----------
+- Abstracts URI-to-file-path conversion
+- Reusable across multiple model handlers
+- Consistent error handling
+- Supports custom "kavach://" URI scheme
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 4: adapter/models/yolov8_handler.py
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: YOLOv8 model implementation for person detection/counting
+IMPORTS: 
+  - onnxruntime (for running ONNX models)
+  - cv2 (OpenCV for image processing)
+  - numpy (array operations)
+  - time (for latency measurement)
+  - BaseModelHandler (parent class)
+  - load_image_from_uri (utility)
+  - config.CONFIDENCE_THRESHOLD, config.INPUT_SIZE
+WHEN IMPORTED: When main.py starts up
+
+WHAT IT CONTAINS:
+-----------------
+1. YOLOv8Handler class - Inherits from BaseModelHandler
+   
+   INITIALIZATION (__init__):
+   - Loads ONNX model using onnxruntime
+   - Creates inference session
+   - Uses CPU execution provider
+   
+   PUBLIC METHODS:
+   - get_supported_tasks() - Returns ["person_detection", "person_counting"]
+   - infer(task, input_data) - Routes to appropriate method based on task
+   
+   PRIVATE HELPER METHODS:
+   - _preprocess(img) - Converts image to model input format
+     * Resizes to 640x640
+     * Normalizes pixel values (0-255 -> 0-1)
+     * Converts BGR to RGB
+     * Creates blob format
+   
+   - _run_inference(blob) - Runs ONNX model
+     * Calls session.run()
+     * Transposes output to correct shape
+   
+   - _filter_person_detections(predictions) - Filters predictions
+     * Keeps only detections above confidence threshold
+     * YOLOv8 class 0 is "person"
+   
+   - _convert_bbox(cx, cy, w, h, img_width, img_height) - Converts bounding boxes
+     * Input: center x, center y, width, height (normalized or pixels)
+     * Output: [left, top, width, height] in original image coordinates
+   
+   - _apply_nms(detections, iou_threshold) - Non-Maximum Suppression
+     * Removes duplicate detections of same person
+     * Uses OpenCV's cv2.dnn.NMSBoxes
+     * IoU threshold = 0.45 (overlap tolerance)
+   
+   - _detect_persons(input_data) - TASK: person_detection
+     * Loads image
+     * Runs inference
+     * Returns HIGHEST confidence person
+     * Output: {label, confidence, bbox, executed_at, latency_ms}
+   
+   - _count_persons(input_data) - TASK: person_counting
+     * Loads image
+     * Runs inference
+     * Applies NMS to avoid duplicates
+     * Returns ALL detected persons
+     * Output: {task, count, confidence, detections[], executed_at, latency_ms}
+
+WHY WRITTEN:
+-----------
+- Implements YOLOv8 object detection for person class
+- Supports two different use cases from one model
+- Uses ONNX for cross-platform compatibility
+- NMS prevents counting same person multiple times
+- Clean separation between detection and counting logic
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 5: adapter/models/__init__.py
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Python package initialization for models module
+IMPORTS: BaseModelHandler, YOLOv8Handler
+WHEN IMPORTED: When main.py does "from .models import YOLOv8Handler"
+
+WHAT IT CONTAINS:
+-----------------
+- Imports and exposes BaseModelHandler and YOLOv8Handler
+- Defines __all__ for clean namespace
+
+WHY WRITTEN:
+-----------
+- Makes models/ a proper Python package
+- Simplifies imports (import from .models instead of .models.yolov8_handler)
+- Controls public API
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 6: adapter/utils/__init__.py
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Python package initialization for utils module
+IMPORTS: load_image_from_uri
+WHEN IMPORTED: When yolov8_handler.py needs image utilities
+
+WHAT IT CONTAINS:
+-----------------
+- Imports and exposes load_image_from_uri
+- Defines __all__ for clean namespace
+
+WHY WRITTEN:
+-----------
+- Makes utils/ a proper Python package
+- Simplifies imports
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 7: adapter/main.py (MAIN ENTRY POINT - SERVER)
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: FastAPI server with REST API endpoints
+IMPORTS:
+  - FastAPI, HTTPException (web framework)
+  - typing.Dict (type hints)
+  - time (timestamps)
+  - .models.YOLOv8Handler (model handler)
+  - .config (configuration)
+WHEN RUN: uvicorn adapter.main:app --reload --port 9100
+
+WHAT IT CONTAINS:
+-----------------
+1. app = FastAPI() - Creates web server instance
+
+2. model_registry = {} - Dictionary mapping task names to handlers
+   Example after startup:
+   {
+     "person_detection": <YOLOv8Handler instance>,
+     "person_counting": <YOLOv8Handler instance>
+   }
+
+3. @app.on_event("startup") async def startup_event()
+   RUNS AUTOMATICALLY when server starts
+   - Loads YOLOv8 model from config
+   - Creates YOLOv8Handler instance
+   - Registers all supported tasks if enabled
+   - Prints status messages
+
+4. @app.get("/health")
+   ENDPOINT: GET http://127.0.0.1:9100/health
+   - Health check endpoint
+   - Returns {"status": "ok"}
+
+5. @app.get("/capabilities")
+   ENDPOINT: GET http://127.0.0.1:9100/capabilities
+   - Lists available tasks
+   - Returns {"tasks": ["person_detection", "person_counting"]}
+   - Dynamically generated from model_registry
+
+6. @app.post("/infer")
+   ENDPOINT: POST http://127.0.0.1:9100/infer
+   - Main inference endpoint
+   - Validates request has "task" field
+   - Checks if task exists in model_registry
+   - Validates input has "input.frame" field
+   - Gets appropriate handler from registry
+   - Calls handler.infer(task, input_data)
+   - Returns result or error
+
+WHY WRITTEN:
+-----------
+- Exposes models as REST API
+- Decouples camera client from model implementation
+- Can serve multiple clients simultaneously
+- Model registry pattern allows dynamic task routing
+- One model can serve multiple tasks efficiently
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 8: kavach/runner.py (CAMERA CLIENT)
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Camera capture and inference client
+IMPORTS:
+  - cv2 (camera capture)
+  - time (intervals)
+  - httpx (HTTP requests)
+  - os, argparse, sys (utilities)
+WHEN RUN: python kavach/runner.py --task person_detection
+
+WHAT IT CONTAINS:
+-----------------
+1. get_available_tasks() - Queries /capabilities endpoint
+   - Fetches list of tasks from adapter
+   - Returns task names list
+
+2. run_camera(task, camera_id, interval) - Main loop
+   FLOW:
+   a. Opens camera using OpenCV
+   b. If camera busy, switches to PASSIVE MODE (watches existing frames)
+   c. Creates frames/camera_X directory
+   d. LOOP:
+      - Captures frame (or watches file)
+      - Saves to frames/camera_X/latest.jpg
+      - Builds JSON payload with task and URI
+      - POSTs to http://127.0.0.1:9100/infer
+      - Parses response
+      - Displays results
+      - Waits for interval
+      - Repeats
+   e. Handles Ctrl+C gracefully
+
+3. main() - Command-line interface
+   - Parses arguments (--task, --camera, --interval, --list-tasks)
+   - Validates task availability
+   - Calls run_camera()
+
+WHY WRITTEN:
+-----------
+- Simulates camera application
+- Demonstrates how to use the adapter API
+- Supports both active (capture) and passive (watch file) modes
+- Handles multiple tasks
+- Clean command-line interface
+- Error handling for network issues
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE 9: verify_setup.py (UTILITY)
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Verify installation and setup
+WHEN RUN: python verify_setup.py
+
+WHAT IT CONTAINS:
+-----------------
+- check_file() - Verifies file exists
+- check_imports() - Verifies all dependencies installed
+- verify_main_requirements() - Checks for ONNX model file
+
+WHY WRITTEN:
+-----------
+- Helps users verify correct setup
+- Checks dependencies are installed
+- Identifies missing files
+
+
+================================================================================
+                        IMPORT DEPENDENCY CHAIN
+================================================================================
+
+Level 1 (No dependencies):
+  - adapter/config.py
+
+Level 2 (Depends on Level 1):
+  - adapter/models/base_handler.py (only uses Python built-ins)
+  - adapter/utils/image_utils.py (imports config.py)
+
+Level 3 (Depends on Level 2):
+  - adapter/models/yolov8_handler.py 
+    * imports base_handler.py
+    * imports image_utils.py
+    * imports config.py
+  - adapter/models/__init__.py
+    * imports base_handler.py
+    * imports yolov8_handler.py
+  - adapter/utils/__init__.py
+    * imports image_utils.py
+
+Level 4 (Depends on Level 3):
+  - adapter/main.py
+    * imports models/__init__.py (gets YOLOv8Handler)
+    * imports config.py
+
+Level 5 (Standalone):
+  - kavach/runner.py (independent client, uses HTTP to talk to main.py)
+  - verify_setup.py (independent utility)
+
+
+================================================================================
+                        DATA FLOW EXAMPLE
+================================================================================
+
+SCENARIO: Counting persons in an image
+
+1. USER ACTION:
+   python kavach/runner.py --task person_counting
+
+2. RUNNER (kavach/runner.py):
+   - Opens camera
+   - Captures frame
+   - Saves to: c:\Users\hp\Desktop\AI_ADAPTER\frames\camera_0\latest.jpg
+   - Creates JSON payload:
+     {
+       "task": "person_counting",
+       "input": {
+         "frame": {
+           "uri": "kavach://frames/camera_0/latest.jpg"
+         }
+       }
+     }
+   - POSTs to http://127.0.0.1:9100/infer
+
+3. ADAPTER (adapter/main.py):
+   - Receives POST at /infer endpoint
+   - Extracts task = "person_counting"
+   - Checks model_registry["person_counting"] -> YOLOv8Handler instance
+   - Validates input has frame.uri
+   - Calls: handler.infer("person_counting", input_data)
+
+4. YOLOV8 HANDLER (adapter/models/yolov8_handler.py):
+   - infer() routes to _count_persons()
+   - _count_persons():
+     a. Calls load_image_from_uri("kavach://frames/camera_0/latest.jpg")
+     b. image_utils.py converts URI to file path
+     c. Loads image with cv2.imread()
+     d. Calls _preprocess(img) -> converts to 640x640 blob
+     e. Calls _run_inference(blob) -> runs ONNX model
+     f. Calls _filter_person_detections() -> filters by confidence
+     g. Loops through detections, converts bounding boxes
+     h. Calls _apply_nms() -> removes duplicates
+     i. Sorts by confidence
+     j. Calculates average confidence
+     k. Returns JSON:
+        {
+          "task": "person_counting",
+          "count": 3,
+          "confidence": 0.82,
+          "detections": [
+            {"bbox": [100, 50, 200, 400], "confidence": 0.87},
+            {"bbox": [350, 60, 180, 390], "confidence": 0.81},
+            {"bbox": [550, 45, 190, 405], "confidence": 0.78}
+          ],
+          "executed_at": 1703584723000,
+          "latency_ms": 145
+        }
+
+5. ADAPTER (adapter/main.py):
+   - Receives result from handler
+   - Returns JSON response to runner
+
+6. RUNNER (kavach/runner.py):
+   - Receives HTTP response
+   - Parses JSON
+   - Prints to console:
+     ✅ Counting | Count: 3 | Avg Conf: 0.82 | Latency: 145ms
+        Person 1: Conf=0.87, BBox=[100, 50, 200, 400]
+        Person 2: Conf=0.81, BBox=[350, 60, 180, 390]
+        Person 3: Conf=0.78, BBox=[550, 45, 190, 405]
+   - Waits 2 seconds
+   - Captures next frame
+   - Repeats
+
+
+================================================================================
+                      SCALABILITY DESIGN PATTERNS
+================================================================================
+
+1. MODEL HANDLER PATTERN
+   ----------------------
+   - Each model is a separate handler class
+   - All inherit from BaseModelHandler
+   - Registered in model_registry during startup
+   - API routes don't know about specific models
+   
+   TO ADD NEW MODEL:
+   a. Create handler class inheriting BaseModelHandler
+   b. Implement get_supported_tasks() and infer()
+   c. Add model config to config.py
+   d. Register in main.py startup_event()
+   
+   BENEFITS:
+   + No API code changes needed
+   + One model can support multiple tasks
+   + Easy to enable/disable tasks
+
+
+2. TASK REGISTRY PATTERN
+   ----------------------
+   - Tasks are registered dynamically at startup
+   - model_registry maps task names to handlers
+   - ENABLED_TASKS controls what's active
+   
+   EXAMPLE:
+   model_registry = {
+     "person_detection": yolov8_handler,
+     "person_counting": yolov8_handler,
+     "face_detection": face_handler,      # Different handler
+     "emotion_detection": face_handler     # Same handler, different task
+   }
+   
+   BENEFITS:
+   + Flexible task-to-model mapping
+   + Easy to share models across tasks
+   + Configuration-based control
+
+
+3. URI ABSTRACTION
+   ----------------
+   - Custom "kavach://" URI scheme
+   - image_utils handles conversion
+   - Decouples runner from file system layout
+   
+   BENEFITS:
+   + Runner doesn't need to know file paths
+   + Easy to change storage backend
+   + Could support remote storage (HTTP, S3, etc.)
+
+
+4. FASTAPI ASYNC ARCHITECTURE
+   ---------------------------
+   - FastAPI can handle multiple requests simultaneously
+   - Model loaded once, shared across requests
+   - Each request gets own inference session
+   
+   BENEFITS:
+   + Multiple cameras can use same adapter
+   + Efficient resource usage
+   + Scalable to many clients
+
+
+================================================================================
+                          KEY TECHNOLOGIES USED
+================================================================================
+
+1. FastAPI
+   - Modern Python web framework
+   - Automatic API documentation
+   - Type validation
+   - Async support
+
+2. ONNX Runtime
+   - Cross-platform model inference
+   - Optimized for CPU/GPU
+   - Supports models from PyTorch, TensorFlow, etc.
+
+3. OpenCV (cv2)
+   - Camera capture
+   - Image preprocessing
+   - NMS implementation
+
+4. NumPy
+   - Array operations
+   - Fast mathematical computations
+
+5. httpx
+   - Modern HTTP client
+   - Async support
+   - Timeout handling
+
+
+================================================================================
+                          COMMON QUESTIONS
+================================================================================
+
+Q: Why ONNX instead of PyTorch/TensorFlow directly?
+A: ONNX is cross-platform, faster, and doesn't require deep learning frameworks.
+
+Q: Why separate runner from adapter?
+A: Separation of concerns. Runner is camera logic, adapter is model logic.
+   They communicate via standard HTTP, could be on different machines.
+
+Q: Why BaseModelHandler abstract class?
+A: Enforces consistent interface. All models MUST implement get_supported_tasks()
+   and infer(). Makes code predictable and maintainable.
+
+Q: Why model_registry instead of if/else statements?
+A: Registry pattern is scalable. Adding new models doesn't require changing
+   routing logic. Tasks can be enabled/disabled via configuration.
+
+Q: What's the purpose of NMS in person_counting?
+A: YOLOv8 can detect same person multiple times with slightly different boxes.
+   NMS removes duplicates based on overlap (IoU), preventing overcounting.
+
+Q: Can one runner use multiple tasks simultaneously?
+A: Yes! Use comma-separated tasks: --task person_detection,person_counting
+
+Q: Can multiple runners run simultaneously?
+A: Yes! FastAPI handles concurrent requests. Multiple cameras can connect.
+
+
+================================================================================
+                          TYPICAL WORKFLOWS
+================================================================================
+
+WORKFLOW 1: Adding a New Model (e.g., Face Detection)
+------------------------------------------------------
+1. Create adapter/models/face_handler.py:
+   class FaceHandler(BaseModelHandler):
+       def get_supported_tasks(self):
+           return ["face_detection", "face_counting"]
+       
+       def infer(self, task, input_data):
+           # Implementation here
+           pass
+
+2. Update adapter/models/__init__.py:
+   from .face_handler import FaceHandler
+   __all__ = [..., "FaceHandler"]
+
+3. Update adapter/config.py:
+   MODEL_CONFIGS = {
+       "yolov8n": {...},
+       "face_net": {
+           "path": "path/to/facenet.onnx",
+           "handler_class": "FaceHandler"
+       }
+   }
+   ENABLED_TASKS = {
+       ...,
+       "face_detection": True,
+       "face_counting": True
+   }
+
+4. Update adapter/main.py startup_event():
+   face_handler = FaceHandler(MODEL_CONFIGS["face_net"]["path"])
+   for task in face_handler.get_supported_tasks():
+       if ENABLED_TASKS.get(task):
+           model_registry[task] = face_handler
+
+5. Run adapter: uvicorn adapter.main:app --reload --port 9100
+
+6. Test: python kavach/runner.py --task face_detection
+
+
+WORKFLOW 2: Running the System
+-------------------------------
+Terminal 1 (Start Adapter):
+   cd c:\Users\hp\Desktop\AI_ADAPTER
+   venv\Scripts\activate
+   uvicorn adapter.main:app --reload --port 9100
+
+Terminal 2 (Run Camera for Detection):
+   cd c:\Users\hp\Desktop\AI_ADAPTER
+   venv\Scripts\activate
+   python kavach/runner.py --task person_detection
+
+Terminal 3 (Optional - Run Another Camera for Counting):
+   cd c:\Users\hp\Desktop\AI_ADAPTER
+   venv\Scripts\activate
+   python kavach/runner.py --task person_counting --camera 1
+
+
+WORKFLOW 3: Troubleshooting
+----------------------------
+1. Check adapter health:
+   curl http://127.0.0.1:9100/health
+
+2. Check available tasks:
+   curl http://127.0.0.1:9100/capabilities
+   OR
+   python kavach/runner.py --list-tasks
+
+3. Verify setup:
+   python verify_setup.py
+
+4. Check if ONNX model exists:
+   dir adapter\yolov8n.onnx
+
+
+================================================================================
+                          FILE SIZE & COMPLEXITY
+================================================================================
+
+Small files (simple, configuration):
+  - adapter/config.py - 33 lines
+  - adapter/models/__init__.py - 8 lines
+  - adapter/utils/__init__.py - 7 lines
+  - verify_setup.py - 50 lines
+
+Medium files (core logic):
+  - adapter/models/base_handler.py - 59 lines
+  - adapter/utils/image_utils.py - 54 lines
+  - adapter/main.py - 95 lines
+
+Large files (complex algorithms):
+  - kavach/runner.py - 249 lines
+  - adapter/models/yolov8_handler.py - 281 lines
+
+
+================================================================================
+                              SUMMARY
+================================================================================
+
+THIS CODEBASE IS:
+- An AI model adapter layer for VoIP cameras
+- Built with FastAPI for REST API
+- Uses ONNX Runtime for cross-platform model inference
+- Designed with scalability in mind (Model Handler Pattern)
+- Separates concerns: camera logic (runner) vs model logic (adapter)
+- Easy to extend with new models and tasks
+
+EXECUTION ORDER:
+1. adapter/config.py - Loaded first (configuration)
+2. adapter/models/base_handler.py - Abstract interface
+3. adapter/utils/image_utils.py - Utilities
+4. adapter/models/yolov8_handler.py - Model implementation
+5. adapter/main.py - Server startup, model registration, API routes
+6. kavach/runner.py - Client that captures and sends inference requests
+
+KEY DESIGN DECISIONS:
+- Registry pattern for task-to-model mapping
+- Abstract base class for consistent handler interface
+- URI abstraction for file paths
+- FastAPI for async, concurrent request handling
+- ONNX for optimized, cross-platform inference
+- NMS for preventing duplicate detections
+
+TO UNDERSTAND THIS CODE:
+1. Start with config.py - see what models and tasks exist
+2. Read base_handler.py - understand the interface contract
+3. Look at yolov8_handler.py - see how a model is implemented
+4. Read main.py - see how models are registered and routed
+5. Check runner.py - see how clients use the API
+
+================================================================================
+
+
+================================================================================
+                        RECENT ENHANCEMENTS (2025)
+================================================================================
+
+═══════════════════════════════════════════════════════════════════════════════
+NEW FILE: kavach/runnerrec.py (VIDEO FILE RUNNER)
+═══════════════════════════════════════════════════════════════════════════════
+PURPOSE: Process video files instead of live camera
+IMPORTS:
+  - cv2 (video file reading)
+  - collections (deque for temporal smoothing)
+  - statistics (mode calculation)
+  - numpy (array operations for visualization)
+  - httpx, time, os, argparse, sys (same as runner.py)
+
+WHAT IT CONTAINS:
+-----------------
+1. draw_boxes(frame, detections, smoothed_count)
+   - Draws colorful bounding boxes around detected people
+   - 8-color palette: Green, Blue, Red, Yellow, Magenta, Cyan, Purple, Orange
+   - Adds labels showing "Person X: confidence"
+   - Displays overall count in top-left corner
+   - Returns annotated frame
+
+2. run_video(task, video_path, camera_id, interval)
+   FLOW:
+   a. Opens video file using cv2.VideoCapture()
+   b. Calculates video properties (FPS, duration, total frames)
+   c. Determines frame skip interval (e.g., every 12 frames for 0.5s at 25 FPS)
+   d. Initializes count_history deque(maxlen=5) for temporal smoothing
+   e. LOOP:
+      - Reads frame from video
+      - Skips frames based on interval (only processes every Nth frame)
+      - Saves frame to latest.jpg
+      - Sends inference request to adapter
+      - For person_counting task:
+        * Adds count to history buffer
+        * Calculates mode (most common count in last 5 frames)
+        * Displays both raw count and smoothed count
+        * Draws bounding boxes on frame
+        * Saves annotated frame to annotated.jpg
+      - Continues until video end
+   f. Gracefully exits when video ends
+
+3. main() - Command-line interface
+   - Same as runner.py but with --video argument
+   - Validates video file exists
+   - Validates tasks are available
+   - Calls run_video()
+
+WHY WRITTEN:
+-----------
+- Process pre-recorded videos for batch analysis
+- Test model accuracy on known video content
+- Frame skipping prevents processing every frame (performance optimization)
+- Temporal smoothing stabilizes count (prevents flickering: 2→1→2→1→2)
+- Visualization provides visual feedback (see boxes on detected people)
+- Saves annotated frames for review
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ENHANCEMENT 1: TEMPORAL SMOOTHING
+═══════════════════════════════════════════════════════════════════════════════
+LOCATION: kavach/runnerrec.py (lines 90, 159-166)
+INSPIRATION: Ultralytics ObjectCounter tracking approach
+
+WHAT IT DOES:
+------------
+- Maintains sliding window of last 5 frame counts
+- Calculates mode (most common value) instead of showing raw count
+- Example: [2, 1, 2, 2, 1] → mode = 2 (most common)
+- Reduces count flickering between frames
+
+HOW IT WORKS:
+------------
+1. count_history = collections.deque(maxlen=5)  # Create buffer
+2. count_history.append(count)  # Add new count
+3. smoothed_count = mode(count_history)  # Get most common
+4. Display smoothed_count instead of raw count
+
+WHY IMPORTANT:
+-------------
+- Detection accuracy varies slightly between frames
+- NMS threshold affects whether 2 nearby people are counted as 1 or 2
+- Smoothing creates stable, tracking-like behavior without full object tracking
+- User sees consistent counts like "Count: 2" instead of "1,2,1,2,1,2..."
+
+BENEFITS:
+--------
++ More professional, production-ready output
++ Simpler than implementing full object tracking
++ No false count changes from minor detection variations
++ Better user experience
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ENHANCEMENT 2: SERVER-SIDE BOUNDING BOX VISUALIZATION (API SERVICE)
+═══════════════════════════════════════════════════════════════════════════════
+LOCATION: adapter/utils/visualization.py + adapter/models/yolov8_handler.py
+PREVIOUS: Was in kavach/runnerrec.py (client-side)
+CURRENT: Now in adapter API (server-side)
+
+WHAT IT DOES:
+------------
+- Automatically generates annotated images for person_counting task
+- Draws colorful rectangles around each detected person
+- Each person gets different color (cycles through 8 colors)
+- Adds text labels showing "Person 1: 0.87" (confidence score)
+- Displays overall count in top-left corner
+- Saves annotated frame to frames/camera_X/annotated.jpg
+- Returns annotated_image_uri in API response
+
+COLOR PALETTE (BGR):
+-------------------
+1. Green     - (0, 255, 0)
+2. Blue      - (255, 0, 0)
+3. Red       - (0, 0, 255)
+4. Yellow    - (0, 255, 255)
+5. Magenta   - (255, 0, 255)
+6. Cyan      - (255, 255, 0)
+7. Purple    - (128, 0, 128)
+8. Orange    - (0, 165, 255)
+
+HOW IT WORKS:
+------------
+1. Client sends inference request to /infer endpoint
+2. YOLOv8Handler.\_count_persons() runs detection
+3. If detections found:
+   a. Calls draw_bounding_boxes(img, detections, count)
+   b. Function creates annotated copy
+   c. For each detection:
+      - Get unique color (i % 8)
+      - Draw rectangle (3px thick)
+      - Add label with confidence
+   d. Add overall count to top-left
+   e. Save to frames/camera_X/annotated.jpg
+   f. Add "annotated_image_uri" to response
+4. Client receives URI in response
+
+WHY IMPORTANT:
+-------------
+- Visual feedback confirms model is working
+- Shows exactly where each person was detected
+- Confidence scores help evaluate model performance
+- Helpful for debugging and demos
+- Annotated frames can be saved for reports
+- SERVER-SIDE: Works with ANY client (React, mobile, web, Python)
+- CENTRALIZED: One implementation for all clients
+- CONSISTENT: Same visualization across all platforms
+
+BENEFITS:
+--------
++ Easy to verify detections visually
++ Colorful output is more engaging
++ Can create video from annotated frames
++ Helps identify false positives/negatives
++ CLIENT-AGNOSTIC: React UI, mobile apps, Python clients all get visualization
++ NO CLIENT CODE: Clients don't implement drawing logic
++ API-BASED: Just fetch the annotated_image_uri from response
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ENHANCEMENT 3: ADAPTIVE THRESHOLD & NMS TUNING
+═══════════════════════════════════════════════════════════════════════════════
+LOCATION: adapter/config.py, adapter/models/yolov8_handler.py
+
+PARAMETERS TUNED:
+----------------
+1. ADAPTIVE CONFIDENCE THRESHOLD (yolov8_handler.py - _filter_person_detections)
+   - **NOT A FIXED VALUE** - Adapts based on object size
+   - Small objects (bbox area < 0.05): threshold = 0.15 (distant people)
+   - Large objects (bbox area >= 0.05): threshold = 0.25 (close people)
+   - Benefits: Catches distant people without increasing false positives
+
+2. NMS IoU Threshold (yolov8_handler.py, line 292)
+   - Original: 0.45
+   - Current: 0.65
+   - Higher threshold = less aggressive suppression
+   - Allows people to stand very close without being merged
+
+HOW ADAPTIVE THRESHOLD WORKS:
+-----------------------------
+Instead of single fixed threshold, uses SIZE-BASED logic:
+
+1. Calculate bounding box area (normalized 0.0 to 1.0):
+   bbox_area = width * height
+
+2. Apply adaptive threshold:
+   - If bbox_area < 0.05 (small/distant):
+     threshold = 0.15  # More sensitive for far people
+   - If bbox_area >= 0.05 (large/close):
+     threshold = 0.25  # Standard threshold for close people
+
+3. Filter:
+   keep detection IF confidence > adaptive_threshold
+
+EXAMPLE:
+--------
+Frame with 3 people:
+- Person 1 (distant, small): bbox_area=0.03, conf=0.18
+  → threshold=0.15, 0.18>0.15 → DETECTED ✅
+  
+- Person 2 (close, large): bbox_area=0.12, conf=0.75
+  → threshold=0.25, 0.75>0.25 → DETECTED ✅
+  
+- False positive (close object): bbox_area=0.08, conf=0.18
+  → threshold=0.25, 0.18<0.25 → REJECTED ✅
+
+HOW NMS WORKS:
+-------------
+NMS (Non-Maximum Suppression) removes duplicate detections:
+
+1. Model detects person at multiple slightly different positions:
+   Box A: [100, 50, 200, 400] conf=0.87
+   Box B: [102, 52, 198, 398] conf=0.85  (very similar to A)
+
+2. Calculate IoU (Intersection over Union):
+   IoU = (overlap area) / (union area)
+   
+3. If IoU > threshold (0.65):
+   - Boxes overlap too much → probably same person
+   - Keep only higher confidence box (Box A)
+   - Discard lower confidence box (Box B)
+
+4. If IoU < threshold:
+   - Boxes don't overlap much → different people
+   - Keep both boxes
+
+WHY ADAPTIVE THRESHOLD WAS NEEDED:
+----------------------------------
+- Fixed low threshold (0.15): Too many false positives
+- Fixed high threshold (0.25): Misses distant people
+- Adaptive approach: Best of both worlds
+  * Sensitive to small objects (distant = real people)
+  * Strict on large objects (close = avoid false positives)
+
+WHY NMS TUNING WAS NEEDED:
+--------------------------
+- Default values optimized for general object detection
+- Person counting has specific requirements:
+  * People often stand close together (need higher NMS threshold)
+  * Distance/lighting varies (adaptive confidence handles this)
+- Iterative testing revealed optimal values
+
+LEARNING PROCESS:
+----------------
+Attempt 1: Lowered confidence to 0.15 (fixed)
+  Result: Too many false positives with close objects
+  
+Attempt 2: Raised confidence to 0.20 (fixed)
+  Result: Better balance but still missed some distant people
+  
+Attempt 3: Tried image preprocessing (sharpening + CLAHE)
+  Result: Processing became laggy, ~100ms added latency
+  
+Attempt 4: Implemented adaptive threshold (FINAL SOLUTION)
+  Result: ✅ Detects distant people (0.15 for small)
+          ✅ Avoids false positives (0.25 for large)
+          ✅ Fast processing (no enhancement overhead)
+          ✅ Best of both worlds
+
+NMS TUNING:
+  - Started: 0.45
+  - Increased to 0.55 (better separation)
+  - Final: 0.65 (handles very close people)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+COMPARISON: runner.py vs runnerrec.py
+═══════════════════════════════════════════════════════════════════════════════
+
+runner.py (Original Camera Runner):
+-----------------------------------
++ Captures from live camera (cv2.VideoCapture(0))
++ Passive mode if camera busy (watches existing files)
++ Processes every N seconds (time.sleep)
++ Simple output display
++ Continuous loop until Ctrl+C
+
+runnerrec.py (Video File Runner):
+---------------------------------
++ Reads from video file (cv2.VideoCapture("rec.mp4"))
++ Frame skipping based on video FPS
++ Temporal smoothing (5-frame buffer)
++ Bounding box visualization (colorful boxes)
++ Saves annotated frames
++ Exits gracefully when video ends
++ Shows smoothed vs raw count
++ Displays video progress info
+
+
+================================================================================
+                    UPDATED EXECUTION WORKFLOW
+================================================================================
+
+WORKFLOW: Processing Video with Visualization
+---------------------------------------------
+Terminal 1 (Start Adapter):
+   cd c:\Users\hp\Desktop\AI_ADAPTER
+   venv\Scripts\activate
+   uvicorn adapter.main:app --reload --port 9100
+
+Terminal 2 (Process Video):
+   cd c:\Users\hp\Desktop\AI_ADAPTER
+   venv\Scripts\activate
+   python kavach/runnerrec.py --task person_counting --video rec.mp4 --interval 0.5
+
+Output:
+   🎬 VIDEO MODE: Processing frames from rec.mp4
+   ============================================================
+   Video Duration: 19.20s
+   Total Frames: 480
+   FPS: 25.00
+   Processing Interval: 0.5s (every 12 frames)
+   Estimated frames to process: ~40
+   ...
+   ✅ Counting  | Count: 2 (smoothed) | Raw: 2 | Avg Conf: 0.68
+   🎨 Saved annotated frame with 2 box(es) to annotated.jpg
+
+Check Results:
+   Open frames/camera_0/annotated.jpg to see colorful boxes!
+
+
+================================================================================
+                         NEW DESIGN PATTERNS ADDED
+================================================================================
+
+5. TEMPORAL SMOOTHING PATTERN
+   ---------------------------
+   - Uses sliding window (deque with maxlen)
+   - Statistical mode for stability
+   - Simulates tracking without object IDs
+   
+   BENEFITS:
+   + Reduces UI flickering
+   + More professional output
+   + Lightweight (no tracking overhead)
+
+6. VISUALIZATION PIPELINE
+   -----------------------
+   - Separate annotation from core inference
+   - Optional feature (doesn't affect API)
+   - Color-coded for multi-object clarity
+   
+   BENEFITS:
+   + Easy debugging
+   + Demo-ready output
+   + Visual quality assurance
+
+
+================================================================================
+                          UPDATED FILE SUMMARY
+================================================================================
+
+Configuration & Setup:
+  - adapter/config.py - 33 lines (updated: CONFIDENCE_THRESHOLD = 0.25)
+
+Base Architecture:
+  - adapter/models/base_handler.py - 59 lines
+  - adapter/utils/image_utils.py - 54 lines
+  - adapter/models/__init__.py - 8 lines
+  - adapter/utils/__init__.py - 7 lines
+
+Core Implementation:
+  - adapter/models/yolov8_handler.py - 288 lines (updated: NMS threshold = 0.55)
+  - adapter/main.py - 95 lines
+
+Clients:
+  - kavach/runner.py - 249 lines (original camera runner)
+  - kavach/runnerrec.py - 352 lines (NEW: video runner with visualization)
+
+Utilities:
+  - verify_setup.py - 50 lines
+
+
+================================================================================
+                         FINAL RECOMMENDATIONS
+================================================================================
+
+FOR DEVELOPMENT:
+---------------
+1. Use runnerrec.py for testing on video files
+2. Check annotated.jpg to verify detections visually
+3. Monitor smoothed vs raw counts to tune NMS/confidence
+4. Adjust CONFIDENCE_THRESHOLD if too many/few detections
+5. Adjust NMS threshold if people are merged/duplicated
+
+FOR PRODUCTION:
+--------------
+1. Use runner.py for live camera feeds
+2. Keep confidence at 0.25 for good recall
+3. Keep NMS at 0.55 for proper person separation
+4. Consider adding temporal smoothing to runner.py if needed
+5. Monitor latency metrics
+
+FOR ADDING NEW FEATURES:
+-----------------------
+1. Temporal smoothing can be added to any counting task
+2. Visualization works with any detection task
+3. Frame skipping pattern is reusable
+4. Color palette can be customized per use case
+
+================================================================================
