@@ -241,6 +241,27 @@ class YOLOv8Handler(BaseModelHandler):
             bbox = self._convert_bbox(cx, cy, w, h, w_img, h_img)
             result["bbox"] = bbox
             result["confidence"] = round(conf, 2)
+            
+            # Generate annotated image with bounding box for detected person
+            detection = {"bbox": bbox, "confidence": round(conf, 2)}
+            annotated_img = draw_bounding_boxes(
+                img,
+                [detection],  # Single detection
+                count=1,
+                show_labels=True,
+                show_count=True
+            )
+            
+            # Save annotated image (extract camera_id from URI)
+            uri_parts = uri.replace("kavach://frames/", "").split("/")
+            camera_dir = uri_parts[0] if uri_parts else "camera_0"
+            
+            annotated_path = os.path.join(BASE_FRAMES_DIR, camera_dir, "annotated.jpg")
+            cv2.imwrite(annotated_path, annotated_img)
+            
+            # Include annotated image URI in response
+            result["annotated_image_uri"] = f"kavach://frames/{camera_dir}/annotated.jpg"
+            print(f"[VISUALIZATION] Saved annotated image to {annotated_path}")
         
         result["latency_ms"] = int((time.time() - start_time) * 1000)
         
